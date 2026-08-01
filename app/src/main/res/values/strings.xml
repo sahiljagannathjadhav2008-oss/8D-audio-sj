@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">8D Audio Converter</string>
+    <string name="notif_channel_conversion">Audio conversion</string>
+    <string name="notif_channel_playback">Playback</string>
+</resources>
