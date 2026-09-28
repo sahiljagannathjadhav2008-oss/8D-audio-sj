@@ -1,0 +1,145 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build, test, and package release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Locate or install Android cmdline-tools
+        id: android_sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$SDK_ROOT" ]; then
+            SDK_ROOT="$HOME/android-sdk"
+          fi
+          mkdir -p "$SDK_ROOT"
+
+          # Different runner images/cmdline-tools versions put sdkmanager under
+          # different version-numbered subfolders (e.g. cmdline-tools/latest,
+          # cmdline-tools/12.0, cmdline-tools/16.0). Find whichever exists
+          # rather than hardcoding one, and pick the newest if several do.
+          SDKMANAGER=$(find "$SDK_ROOT/cmdline-tools" -maxdepth 3 -type f -name sdkmanager 2>/dev/null | sort -V | tail -n 1 || true)
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "No preinstalled cmdline-tools found under $SDK_ROOT — downloading a known-good version."
+            TMP_ZIP="$(mktemp -d)/cmdline-tools.zip"
+            curl -sSL -o "$TMP_ZIP" "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+            mkdir -p "$SDK_ROOT/cmdline-tools"
+            unzip -q "$TMP_ZIP" -d "$SDK_ROOT/cmdline-tools"
+            # The zip extracts to cmdline-tools/cmdline-tools; sdkmanager
+            # expects a version-named folder (e.g. "latest") one level in.
+            mv "$SDK_ROOT/cmdline-tools/cmdline-tools" "$SDK_ROOT/cmdline-tools/latest"
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          fi
+
+          echo "Using sdkmanager at $SDKMANAGER"
+          echo "sdk_root=$SDK_ROOT" >> "$GITHUB_OUTPUT"
+          echo "sdkmanager=$SDKMANAGER" >> "$GITHUB_OUTPUT"
+
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: yes | "${{ steps.android_sdk.outputs.sdkmanager }}" --licenses --sdk_root="${{ steps.android_sdk.outputs.sdk_root }}" > /dev/null || true
+
+      - name: Install required Android SDK packages
+        # Only what this project's build.gradle.kts actually declares:
+        # compileSdk/targetSdk 34, matching build-tools, and platform-tools
+        # for adb/aapt2 support tooling. Deliberately does NOT install the
+        # obsolete "tools" package, which Google has removed from the SDK
+        # repository and which older setup actions still request by default.
+        shell: bash
+        run: |
+          "${{ steps.android_sdk.outputs.sdkmanager }}" --sdk_root="${{ steps.android_sdk.outputs.sdk_root }}" \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0"
+
+      - name: Write local.properties for Gradle
+        # Gradle/AGP resolve the SDK location from local.properties'
+        # sdk.dir (or ANDROID_HOME/ANDROID_SDK_ROOT). We write it explicitly
+        # so the build finds the SDK regardless of which path was resolved
+        # above (preinstalled vs. freshly downloaded), rather than relying
+        # on environment variables carrying over correctly between steps.
+        shell: bash
+        run: echo "sdk.dir=${{ steps.android_sdk.outputs.sdk_root }}" > local.properties
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Run unit tests
+        run: ./gradlew test --stacktrace
+
+      - name: Run lint
+        run: ./gradlew lint --stacktrace
+
+      - name: Build release APK
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Verify release APK was produced
+        run: |
+          APK_PATH=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          if [ -z "$APK_PATH" ]; then
+            echo "No release APK found under app/build/outputs/apk/release"
+            exit 1
+          fi
+          echo "Found APK at $APK_PATH"
+          unzip -l "$APK_PATH" | grep -q "AndroidManifest.xml" || (echo "AndroidManifest.xml missing from APK" && exit 1)
+          unzip -l "$APK_PATH" | grep -q "classes.dex" || (echo "classes.dex missing from APK" && exit 1)
+          echo "APK_PATH=$APK_PATH" >> "$GITHUB_ENV"
+
+      - name: Upload release APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 8DAudio-release-apk
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: app/build/reports/tests
+          if-no-files-found: ignore
+
+      - name: Upload lint reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-reports
+          path: |
+            app/build/reports/lint-results-*.html
+            app/build/reports/lint-results-*.txt
+            app/build/reports/lint-results-*.xml
+          if-no-files-found: ignore
